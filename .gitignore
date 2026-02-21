@@ -1,0 +1,38 @@
+# Environment variables
+.env
+.env.local
+.env.production
+
+# Google credentials (NEVER commit)
+config/google_credentials.json
+*credentials*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Output files
+output/
+reports/
+*.csv
+!requirements.txt
