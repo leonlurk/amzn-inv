@@ -13,6 +13,7 @@ from pathlib import Path
 # Add project root to path so we can import src
 sys.path.insert(0, str(Path(__file__).parent))
 
+from sp_api.base import Marketplaces
 from src.config import Config
 from src.sp_api_client import SPAPIClient, SalesData, get_mock_sales_data
 from src.ads_api_client import AmazonAdsClient, AdsData, get_mock_ads_data
