@@ -1,37 +1,53 @@
-"""Configuration loader for Amazon API credentials."""
+"""Configuration loader for Amazon API credentials.
+
+Supports two sources (in priority order):
+1. Streamlit secrets (st.secrets) — used on Streamlit Cloud
+2. Environment variables / .env file — used locally
+"""
 import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env from project root
+# Load .env from project root (no-op on Streamlit Cloud)
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(env_path)
+
+
+def _get(key: str, default: str = '') -> str:
+    """Get config value from st.secrets first, then env vars."""
+    try:
+        import streamlit as st
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except (ImportError, Exception):
+        pass
+    return os.getenv(key, default)
 
 
 class Config:
     """Amazon API configuration."""
 
     # SP-API Credentials
-    SP_API_CLIENT_ID = os.getenv('SP_API_CLIENT_ID')
-    SP_API_CLIENT_SECRET = os.getenv('SP_API_CLIENT_SECRET')
-    SP_API_REFRESH_TOKEN = os.getenv('SP_API_REFRESH_TOKEN')
-    SP_API_APP_ID = os.getenv('SP_API_APP_ID')
+    SP_API_CLIENT_ID = _get('SP_API_CLIENT_ID')
+    SP_API_CLIENT_SECRET = _get('SP_API_CLIENT_SECRET')
+    SP_API_REFRESH_TOKEN = _get('SP_API_REFRESH_TOKEN')
+    SP_API_APP_ID = _get('SP_API_APP_ID')
 
     # Marketplace
-    MARKETPLACE_ID = os.getenv('MARKETPLACE_ID', 'ATVPDKIKX0DER')  # Default US
+    MARKETPLACE_ID = _get('MARKETPLACE_ID', 'ATVPDKIKX0DER')
 
     # Advertising API Credentials
-    ADS_API_CLIENT_ID = os.getenv('ADS_API_CLIENT_ID')
-    ADS_API_CLIENT_SECRET = os.getenv('ADS_API_CLIENT_SECRET')
-    ADS_API_REFRESH_TOKEN = os.getenv('ADS_API_REFRESH_TOKEN')
-    ADS_API_PROFILE_ID = os.getenv('ADS_API_PROFILE_ID')
+    ADS_API_CLIENT_ID = _get('ADS_API_CLIENT_ID')
+    ADS_API_CLIENT_SECRET = _get('ADS_API_CLIENT_SECRET')
+    ADS_API_REFRESH_TOKEN = _get('ADS_API_REFRESH_TOKEN')
+    ADS_API_PROFILE_ID = _get('ADS_API_PROFILE_ID')
 
     # Sandbox mode
-    USE_SANDBOX = os.getenv('USE_SANDBOX', 'true').lower() == 'true'
+    USE_SANDBOX = _get('USE_SANDBOX', 'true').lower() == 'true'
 
     # Google Sheets
-    GOOGLE_SHEET_ID = os.getenv('GOOGLE_SHEET_ID')
-    GOOGLE_SHEET_NAME = os.getenv('GOOGLE_SHEET_NAME', 'Sheet1')
+    GOOGLE_SHEET_ID = _get('GOOGLE_SHEET_ID')
+    GOOGLE_SHEET_NAME = _get('GOOGLE_SHEET_NAME', 'Sheet1')
 
     @classmethod
     def validate_sp_api(cls) -> bool:
