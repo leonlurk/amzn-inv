@@ -1,7 +1,7 @@
 # Environment variables
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
 
 # Google credentials (NEVER commit)
 config/google_credentials.json
@@ -16,6 +16,9 @@ __pycache__/
 venv/
 env/
 .venv/
+*.egg-info/
+dist/
+build/
 
 # IDE
 .vscode/
@@ -26,6 +29,7 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+nul
 
 # Logs
 *.log
@@ -35,4 +39,8 @@ logs/
 output/
 reports/
 *.csv
+*.xlsx
 !requirements.txt
+
+# Streamlit
+.streamlit/secrets.toml

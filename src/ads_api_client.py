@@ -1,6 +1,8 @@
-"""Amazon Advertising API client for fetching PPC/campaign data."""
+"""Amazon Advertising API client for fetching PPC/campaign data (v3 API)."""
 import json
 import time
+import gzip
+import io
 import requests
 from datetime import datetime, timedelta
 from typing import Optional
@@ -14,8 +16,9 @@ class AdsData:
     """Advertising data from Amazon Ads API."""
     date: str
     spend: float  # PPC Spend
-    attributed_orders: int  # Orders from ads
-    attributed_revenue: float  # Sales from ads (7-day attribution)
+    attributed_orders: int  # Orders from ads (purchases7d)
+    attributed_revenue: float  # Sales from ads (sales7d)
+    attributed_units: int  # Units sold from ads (unitsSoldClicks7d)
     clicks: int
     impressions: int
     acos: float  # Advertising Cost of Sales (%)
@@ -28,249 +31,202 @@ class AdsData:
             return round(self.spend / self.attributed_orders, 2)
         return 0.0
 
-    @classmethod
-    def from_api_response(cls, data: dict, date: str) -> 'AdsData':
-        """Parse API response into AdsData object."""
-        spend = float(data.get('cost', data.get('spend', 0)))
-        attributed_revenue = float(data.get('sales', data.get('attributedSales7d', 0)))
-        attributed_orders = int(data.get('purchases', data.get('attributedConversions7d', 0)))
-
-        # Calculate ACoS and ROAS if not provided
-        acos = float(data.get('acos', 0))
-        roas = float(data.get('roas', 0))
-
-        if acos == 0 and attributed_revenue > 0:
-            acos = round((spend / attributed_revenue) * 100, 2)
-        if roas == 0 and spend > 0:
-            roas = round(attributed_revenue / spend, 2)
-
-        return cls(
-            date=date,
-            spend=spend,
-            attributed_orders=attributed_orders,
-            attributed_revenue=attributed_revenue,
-            clicks=int(data.get('clicks', 0)),
-            impressions=int(data.get('impressions', 0)),
-            acos=acos,
-            roas=roas
-        )
-
 
 class AmazonAdsClient:
-    """Client for Amazon Advertising API."""
+    """Client for Amazon Advertising API (v3)."""
 
     TOKEN_URL = 'https://api.amazon.com/auth/o2/token'
-    API_BASE_URL = 'https://advertising-api.amazon.com'
-    SANDBOX_BASE_URL = 'https://advertising-api-test.amazon.com'
+    API_BASE = 'https://advertising-api.amazon.com'
 
     def __init__(self):
         self.client_id = Config.ADS_API_CLIENT_ID
         self.client_secret = Config.ADS_API_CLIENT_SECRET
         self.refresh_token = Config.ADS_API_REFRESH_TOKEN
         self.profile_id = Config.ADS_API_PROFILE_ID
-        self.use_sandbox = Config.USE_SANDBOX
         self._access_token = None
         self._token_expiry = None
-
-    @property
-    def base_url(self) -> str:
-        """Get API base URL based on sandbox setting."""
-        return self.SANDBOX_BASE_URL if self.use_sandbox else self.API_BASE_URL
 
     def _get_access_token(self) -> str:
         """Get or refresh access token."""
         if self._access_token and self._token_expiry and datetime.now() < self._token_expiry:
             return self._access_token
 
-        response = requests.post(
-            self.TOKEN_URL,
-            data={
-                'grant_type': 'refresh_token',
-                'refresh_token': self.refresh_token,
-                'client_id': self.client_id,
-                'client_secret': self.client_secret,
-            }
-        )
+        response = requests.post(self.TOKEN_URL, data={
+            'grant_type': 'refresh_token',
+            'refresh_token': self.refresh_token,
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+        })
         response.raise_for_status()
 
         token_data = response.json()
         self._access_token = token_data['access_token']
         self._token_expiry = datetime.now() + timedelta(seconds=token_data.get('expires_in', 3600) - 60)
-
         return self._access_token
 
-    def _get_headers(self) -> dict:
-        """Get headers for API requests."""
+    def _base_headers(self) -> dict:
+        """Base headers for all API requests."""
         return {
             'Authorization': f'Bearer {self._get_access_token()}',
             'Amazon-Advertising-API-ClientId': self.client_id,
             'Amazon-Advertising-API-Scope': self.profile_id,
-            'Content-Type': 'application/json',
         }
-
-    def get_profiles(self) -> list[dict]:
-        """Get advertising profiles (needed to get profile_id)."""
-        response = requests.get(
-            f'{self.base_url}/v2/profiles',
-            headers={
-                'Authorization': f'Bearer {self._get_access_token()}',
-                'Amazon-Advertising-API-ClientId': self.client_id,
-            }
-        )
-        response.raise_for_status()
-        return response.json()
-
-    def request_sp_report(
-        self,
-        start_date: datetime,
-        end_date: datetime,
-        metrics: Optional[list[str]] = None
-    ) -> str:
-        """
-        Request a Sponsored Products performance report.
-
-        Args:
-            start_date: Report start date
-            end_date: Report end date
-            metrics: List of metrics to include
-
-        Returns:
-            Report ID
-        """
-        if metrics is None:
-            metrics = [
-                'impressions', 'clicks', 'cost', 'purchases7d',
-                'sales7d', 'attributedSales7d', 'attributedConversions7d'
-            ]
-
-        payload = {
-            'reportDate': start_date.strftime('%Y%m%d'),
-            'metrics': ','.join(metrics),
-            'segment': 'placement',
-            'creativeType': 'all',
-        }
-
-        response = requests.post(
-            f'{self.base_url}/v2/sp/campaigns/report',
-            headers=self._get_headers(),
-            json=payload
-        )
-        response.raise_for_status()
-
-        return response.json().get('reportId')
-
-    def get_report_status(self, report_id: str) -> dict:
-        """Check report generation status."""
-        response = requests.get(
-            f'{self.base_url}/v2/reports/{report_id}',
-            headers=self._get_headers()
-        )
-        response.raise_for_status()
-        return response.json()
-
-    def download_report(self, report_url: str) -> list[dict]:
-        """Download completed report."""
-        response = requests.get(report_url, headers=self._get_headers())
-        response.raise_for_status()
-
-        # Reports are gzipped JSON
-        import gzip
-        import io
-
-        try:
-            with gzip.GzipFile(fileobj=io.BytesIO(response.content)) as f:
-                return json.loads(f.read().decode('utf-8'))
-        except:
-            return response.json()
 
     def fetch_ads_data(
         self,
         start_date: datetime,
         end_date: Optional[datetime] = None,
-        wait_for_completion: bool = True,
-        max_wait_seconds: int = 300
+        max_wait_seconds: int = 900
     ) -> list[AdsData]:
         """
-        Fetch advertising performance data.
+        Fetch advertising performance data using v3 reporting API.
+
+        Creates a single DAILY report for the full date range,
+        then aggregates per day across all campaigns.
 
         Args:
             start_date: Report start date
-            end_date: Report end date
-            wait_for_completion: Whether to wait for report
-            max_wait_seconds: Maximum wait time
+            end_date: Report end date (default: same as start)
+            max_wait_seconds: Maximum wait for report generation
 
         Returns:
-            List of AdsData objects
+            List of AdsData objects, one per day
         """
         if end_date is None:
             end_date = start_date
 
+        start_str = start_date.strftime('%Y-%m-%d')
+        end_str = end_date.strftime('%Y-%m-%d')
+
+        # Request report
+        report_id = self._create_report(start_str, end_str)
+        print(f"  Ads report requested: {report_id}")
+
+        # Poll for completion
+        report_data = self._wait_for_report(report_id, max_wait_seconds)
+
+        if report_data is None:
+            print("  [WARN] Ads report timed out, returning empty data")
+            return []
+
+        # Aggregate by date
+        return self._aggregate_by_date(report_data)
+
+    def _create_report(self, start_date: str, end_date: str) -> str:
+        """Create an async report request."""
+        headers = self._base_headers()
+        headers['Content-Type'] = 'application/vnd.createasyncreportrequest.v3+json'
+        headers['Accept'] = 'application/vnd.createasyncreportrequest.v3+json'
+
+        payload = {
+            'name': 'PPC Daily Report',
+            'startDate': start_date,
+            'endDate': end_date,
+            'configuration': {
+                'adProduct': 'SPONSORED_PRODUCTS',
+                'groupBy': ['campaign'],
+                'columns': [
+                    'campaignName', 'impressions', 'clicks',
+                    'spend', 'sales7d', 'purchases7d',
+                    'unitsSoldClicks7d',
+                    'date',
+                ],
+                'reportTypeId': 'spCampaigns',
+                'timeUnit': 'DAILY',
+                'format': 'GZIP_JSON',
+            }
+        }
+
+        response = requests.post(
+            f'{self.API_BASE}/reporting/reports',
+            headers=headers,
+            json=payload
+        )
+        response.raise_for_status()
+        return response.json()['reportId']
+
+    def _wait_for_report(self, report_id: str, max_wait: int) -> Optional[list]:
+        """Poll until report is COMPLETED or timeout."""
+        headers = self._base_headers()
+        start_time = time.time()
+
+        while time.time() - start_time < max_wait:
+            response = requests.get(
+                f'{self.API_BASE}/reporting/reports/{report_id}',
+                headers=headers
+            )
+            response.raise_for_status()
+            status = response.json()
+
+            report_status = status.get('status')
+            elapsed = int(time.time() - start_time)
+            print(f"  Ads report: {report_status} ({elapsed}s)")
+
+            if report_status == 'COMPLETED':
+                return self._download_report(status['url'])
+            elif report_status == 'FAILURE':
+                print(f"  [ERROR] Report failed: {status.get('failureReason')}")
+                return None
+
+            time.sleep(10)
+
+        return None
+
+    def _download_report(self, url: str) -> list:
+        """Download and decompress a completed report."""
+        response = requests.get(url)
+        response.raise_for_status()
+
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(response.content)) as f:
+                return json.loads(f.read().decode('utf-8'))
+        except Exception:
+            return response.json()
+
+    def _aggregate_by_date(self, records: list[dict]) -> list[AdsData]:
+        """Aggregate campaign-level records into daily totals."""
+        daily = {}
+
+        for record in records:
+            date = record.get('date', '')
+            if date not in daily:
+                daily[date] = {
+                    'spend': 0.0, 'sales': 0.0, 'orders': 0,
+                    'units': 0, 'clicks': 0, 'impressions': 0,
+                }
+
+            d = daily[date]
+            d['spend'] += float(record.get('spend', 0))
+            d['sales'] += float(record.get('sales7d', 0))
+            d['orders'] += int(record.get('purchases7d', 0))
+            d['units'] += int(record.get('unitsSoldClicks7d', 0))
+            d['clicks'] += int(record.get('clicks', 0))
+            d['impressions'] += int(record.get('impressions', 0))
+
         results = []
+        for date in sorted(daily.keys()):
+            d = daily[date]
+            spend = round(d['spend'], 2)
+            sales = round(d['sales'], 2)
+            acos = round((spend / sales) * 100, 2) if sales > 0 else 0
+            roas = round(sales / spend, 2) if spend > 0 else 0
 
-        # Request reports for each day (API limitation)
-        current_date = start_date
-        while current_date <= end_date:
-            report_id = self.request_sp_report(current_date, current_date)
-            print(f"Report requested for {current_date.strftime('%Y-%m-%d')}: {report_id}")
-
-            if wait_for_completion:
-                start_time = time.time()
-                while time.time() - start_time < max_wait_seconds:
-                    status = self.get_report_status(report_id)
-
-                    if status.get('status') == 'SUCCESS':
-                        report_url = status.get('location')
-                        report_data = self.download_report(report_url)
-
-                        # Aggregate data for the day
-                        day_data = self._aggregate_report_data(
-                            report_data,
-                            current_date.strftime('%Y-%m-%d')
-                        )
-                        results.append(day_data)
-                        break
-                    elif status.get('status') == 'FAILURE':
-                        print(f"Report failed for {current_date}")
-                        break
-
-                    time.sleep(5)
-
-            current_date += timedelta(days=1)
+            results.append(AdsData(
+                date=date,
+                spend=spend,
+                attributed_orders=d['orders'],
+                attributed_revenue=sales,
+                attributed_units=d['units'],
+                clicks=d['clicks'],
+                impressions=d['impressions'],
+                acos=acos,
+                roas=roas,
+            ))
 
         return results
 
-    def _aggregate_report_data(self, report_data: list[dict], date: str) -> AdsData:
-        """Aggregate campaign-level data into daily totals."""
-        total_spend = 0.0
-        total_sales = 0.0
-        total_orders = 0
-        total_clicks = 0
-        total_impressions = 0
 
-        for campaign in report_data:
-            total_spend += float(campaign.get('cost', 0))
-            total_sales += float(campaign.get('sales7d', campaign.get('attributedSales7d', 0)))
-            total_orders += int(campaign.get('purchases7d', campaign.get('attributedConversions7d', 0)))
-            total_clicks += int(campaign.get('clicks', 0))
-            total_impressions += int(campaign.get('impressions', 0))
-
-        # Calculate metrics
-        acos = (total_spend / total_sales * 100) if total_sales > 0 else 0
-        roas = (total_sales / total_spend) if total_spend > 0 else 0
-
-        return AdsData(
-            date=date,
-            spend=round(total_spend, 2),
-            attributed_orders=total_orders,
-            attributed_revenue=round(total_sales, 2),
-            clicks=total_clicks,
-            impressions=total_impressions,
-            acos=round(acos, 2),
-            roas=round(roas, 2)
-        )
-
-
-# Mock data for sandbox testing
+# Mock data for testing
 def get_mock_ads_data(start_date: datetime, days: int = 7) -> list[AdsData]:
     """Generate mock advertising data for testing."""
     import random
@@ -279,8 +235,9 @@ def get_mock_ads_data(start_date: datetime, days: int = 7) -> list[AdsData]:
     for i in range(days):
         date = start_date + timedelta(days=i)
         spend = round(random.uniform(50, 200), 2)
-        revenue = round(spend * random.uniform(2, 5), 2)  # ROAS between 2-5x
+        revenue = round(spend * random.uniform(2, 5), 2)
         orders = random.randint(5, 25)
+        units = orders + random.randint(0, 5)
 
         acos = round((spend / revenue) * 100, 2) if revenue > 0 else 0
         roas = round(revenue / spend, 2) if spend > 0 else 0
@@ -290,18 +247,11 @@ def get_mock_ads_data(start_date: datetime, days: int = 7) -> list[AdsData]:
             spend=spend,
             attributed_orders=orders,
             attributed_revenue=revenue,
+            attributed_units=units,
             clicks=random.randint(100, 500),
             impressions=random.randint(5000, 20000),
             acos=acos,
-            roas=roas
+            roas=roas,
         ))
 
     return results
-
-
-if __name__ == '__main__':
-    print("Testing with mock advertising data...")
-    mock_data = get_mock_ads_data(datetime.now() - timedelta(days=7))
-    for data in mock_data:
-        print(f"{data.date}: ${data.spend:.2f} spend, ${data.attributed_revenue:.2f} revenue, "
-              f"ROAS: {data.roas:.2f}x, ACoS: {data.acos:.1f}%")
