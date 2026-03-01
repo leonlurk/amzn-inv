@@ -429,38 +429,35 @@ metrics = []
 inventory = None
 daily_orders = None
 
-with st.status("Fetching data from Amazon APIs...", expanded=True) as status:
-    # 1. Sales
-    st.write("Requesting sales report from SP-API...")
+progress_bar = st.progress(0, text="Connecting to Amazon APIs...")
+
+# 1. Sales + Ads
+try:
+    sales_data, ads_data = load_sales_ads(start_str, end_str, use_mock)
+    metrics = build_metrics(sales_data, ads_data)
+except Exception as e:
+    st.toast(f"Sales/Ads error: {e}", icon="⚠️")
+progress_bar.progress(33, text="Sales & Ads loaded. Fetching inventory...")
+
+# 2. Inventory
+if include_inventory:
     try:
-        sales_data, ads_data = load_sales_ads(start_str, end_str, use_mock)
-        st.write(f"Sales: {len(sales_data)} days | Ads: {len(ads_data)} days")
-        metrics = build_metrics(sales_data, ads_data)
+        inventory = load_inventory(use_mock)
     except Exception as e:
-        st.write(f"Error: {e}")
+        st.toast(f"Inventory error: {e}", icon="⚠️")
+progress_bar.progress(66, text="Inventory loaded. Fetching orders...")
 
-    # 2. Inventory
-    if include_inventory:
-        st.write("Fetching inventory snapshot...")
-        try:
-            inventory = load_inventory(use_mock)
-            st.write(f"Inventory: {len(inventory)} products")
-        except Exception as e:
-            st.write(f"Inventory failed: {e}")
+# 3. Orders
+if include_orders:
+    try:
+        daily_orders = load_orders(start_str, end_str, use_mock)
+    except Exception as e:
+        st.toast(f"Orders error: {e}", icon="⚠️")
+progress_bar.progress(100, text="All data loaded!")
 
-    # 3. Orders
-    if include_orders:
-        st.write("Fetching daily orders...")
-        try:
-            daily_orders = load_orders(start_str, end_str, use_mock)
-            st.write(f"Orders: {len(daily_orders)} days")
-        except Exception as e:
-            st.write(f"Orders failed: {e}")
-
-    if metrics:
-        status.update(label="All data loaded!", state="complete", expanded=False)
-    else:
-        status.update(label="No data available", state="error", expanded=True)
+import time as _time
+_time.sleep(0.5)
+progress_bar.empty()
 
 
 # ---------- Handle export actions ----------
@@ -896,21 +893,45 @@ if use_mock:
 else:
     import pandas as pd
 
-    with st.status("Loading settlement reports...", expanded=False) as settle_status:
+    with st.spinner("Loading settlement reports..."):
         settlements = load_settlements(use_mock)
-        if settlements:
-            settle_status.update(label=f"Loaded {len(settlements)} settlement(s)", state="complete")
-        else:
-            settle_status.update(label="No settlements found", state="error")
 
     if settlements:
-        # Settlement selector
-        settlement_options = {
-            f"{s.start_date[:10]} to {s.end_date[:10]} — Payout: ${s.total_amount:,.2f}": i
-            for i, s in enumerate(settlements)
-        }
-        selected_label = st.selectbox("Select Settlement Period", list(settlement_options.keys()))
+        # Settlement selector — prominent styling
+        st.markdown("""
+        <style>
+            div[data-testid="stSelectbox"][aria-label="Select Settlement Period"] {
+                background: linear-gradient(145deg, #1a1a35, #252550);
+                border: 2px solid rgba(99,102,241,0.5);
+                border-radius: 12px;
+                padding: 8px 12px;
+            }
+        </style>
+        """, unsafe_allow_html=True)
+
+        settle_sel_col1, settle_sel_col2 = st.columns([1, 2])
+        with settle_sel_col1:
+            st.markdown("""
+            <div style="background: linear-gradient(145deg, #1e1e30, #252540);
+                        border: 1px solid rgba(99,102,241,0.4);
+                        border-radius: 12px; padding: 16px 20px; height: 100%;">
+                <div style="color:#a5b4fc; font-size:0.75rem; font-weight:600; text-transform:uppercase; letter-spacing:1px;">Settlement Period</div>
+                <div style="color:#fff; font-size:1rem; margin-top:6px;">Select a closed settlement to analyze</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with settle_sel_col2:
+            settlement_options = {
+                f"📋  {s.start_date[:10]}  →  {s.end_date[:10]}   |   Payout: ${s.total_amount:,.2f}": i
+                for i, s in enumerate(settlements)
+            }
+            selected_label = st.selectbox(
+                "Select Settlement Period",
+                list(settlement_options.keys()),
+                label_visibility="collapsed",
+            )
         sel = settlements[settlement_options[selected_label]]
+
+        st.markdown("<br>", unsafe_allow_html=True)
 
         # --- Reconciliation KPIs ---
         rec_cols = st.columns(4)
