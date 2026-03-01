@@ -18,6 +18,7 @@ from src.sp_api_client import SPAPIClient, SalesData, get_mock_sales_data
 from src.ads_api_client import AmazonAdsClient, AdsData, get_mock_ads_data
 from src.inventory_client import InventoryClient, InventoryItem, get_mock_inventory
 from src.orders_client import OrdersClient, DailyOrders, get_mock_daily_orders
+from src.finances_client import FinancesClient
 from src.metrics import CombinedMetrics, aggregate_weekly
 from src.output import export_to_csv, export_to_google_sheets
 
@@ -281,6 +282,28 @@ def load_orders(start_str: str, end_str: str, use_mock: bool):
         client = OrdersClient()
         return client.fetch_orders_by_day(start_date, end_date)
     return get_mock_daily_orders(start_date, days)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_settlements(use_mock: bool):
+    """Fetch recent settlement reports. Cached for 10 minutes."""
+    if use_mock:
+        return []
+    if Config.validate_sp_api():
+        client = FinancesClient()
+        reports = client.list_settlement_reports(max_results=5)
+        settlements = []
+        for report in reports:
+            try:
+                doc_id = report.get('reportDocumentId')
+                if doc_id:
+                    tsv = client.download_settlement_report(doc_id)
+                    summary = client.parse_settlement_tsv(tsv)
+                    settlements.append(summary)
+            except Exception as e:
+                print(f"Error downloading settlement: {e}")
+        return settlements
+    return []
 
 
 def build_metrics(sales_data, ads_data):
@@ -861,6 +884,184 @@ if metrics:
 
 else:
     st.warning("No metrics data available. Adjust date range or check API configuration.")
+
+# ---------------------------------------------------------------------------
+# Reconciliation Section
+# ---------------------------------------------------------------------------
+st.markdown('<div class="section-header">SETTLEMENT RECONCILIATION</div>', unsafe_allow_html=True)
+
+if use_mock:
+    st.info("Settlement reconciliation is only available with live API data.")
+else:
+    import pandas as pd
+
+    with st.status("Loading settlement reports...", expanded=False) as settle_status:
+        settlements = load_settlements(use_mock)
+        if settlements:
+            settle_status.update(label=f"Loaded {len(settlements)} settlement(s)", state="complete")
+        else:
+            settle_status.update(label="No settlements found", state="error")
+
+    if settlements:
+        # Settlement selector
+        settlement_options = {
+            f"{s.start_date[:10]} to {s.end_date[:10]} — Payout: ${s.total_amount:,.2f}": i
+            for i, s in enumerate(settlements)
+        }
+        selected_label = st.selectbox("Select Settlement Period", list(settlement_options.keys()))
+        sel = settlements[settlement_options[selected_label]]
+
+        # --- Reconciliation KPIs ---
+        rec_cols = st.columns(4)
+        with rec_cols[0]:
+            kpi_card("Payout Amount", f"${sel.total_amount:,.2f}", f"Settlement {sel.settlement_id[:8]}")
+        with rec_cols[1]:
+            kpi_card("Sum of Rows", f"${sel.sum_of_rows:,.2f}", f"{len(sel.rows)} transactions")
+        with rec_cols[2]:
+            diff = round(sel.sum_of_rows - sel.total_amount, 2)
+            kpi_card("Difference", f"${diff:,.2f}",
+                     "RECONCILED" if sel.reconciles else "MISMATCH",
+                     "up" if sel.reconciles else "down")
+        with rec_cols[3]:
+            kpi_card("Orders", f"{len(sel.unique_order_ids)}", "Unique order IDs")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # --- Breakdown Chart (Sankey-style waterfall) ---
+        breakdown_col, table_col = st.columns([3, 2])
+
+        with breakdown_col:
+            categories = [
+                'Product Charges', 'Shipping', 'Inv. Reimbursements', 'Refunded Expenses',
+                'Refunded Sales', 'Promo Rebates', 'FBA Fees',
+                'Cost of Advertising', 'Shipping Charges', 'Amazon Fees', 'Other Fees',
+            ]
+            values = [
+                sel.product_charges, sel.shipping_revenue, sel.inventory_reimbursements,
+                sel.refunded_expenses, sel.refunded_sales, sel.promo_rebates,
+                sel.fba_fees, sel.advertising_costs, sel.shipping_charges,
+                sel.amazon_fees, sel.other_fees,
+            ]
+            bar_colors = [
+                COLORS['success'], COLORS['accent'], COLORS['success'], COLORS['success'],
+                COLORS['danger'], COLORS['warning'], COLORS['danger'],
+                COLORS['danger'], COLORS['danger'], COLORS['danger'], COLORS['danger'],
+            ]
+
+            fig_breakdown = go.Figure()
+            fig_breakdown.add_trace(go.Bar(
+                x=categories,
+                y=values,
+                marker_color=bar_colors,
+                opacity=0.85,
+                text=[f"${v:,.2f}" for v in values],
+                textposition='outside',
+                textfont=dict(size=11, color=COLORS['text']),
+            ))
+            fig_breakdown.update_layout(
+                **CHART_LAYOUT,
+                title=dict(text='Settlement Breakdown', font=dict(size=14)),
+                yaxis_title='Amount ($)',
+                height=420,
+                showlegend=False,
+            )
+            # Add payout reference line
+            fig_breakdown.add_hline(
+                y=sel.total_amount, line_dash="dash",
+                line_color=COLORS['accent'], opacity=0.6,
+                annotation_text=f"Payout: ${sel.total_amount:,.2f}",
+                annotation_font_color=COLORS['accent'],
+            )
+            st.plotly_chart(fig_breakdown, use_container_width=True)
+
+        with table_col:
+            st.markdown("**Category Breakdown**")
+            breakdown_rows = []
+            for cat, val in zip(categories, values):
+                breakdown_rows.append({'Category': cat, 'Amount': f"${val:,.2f}"})
+            breakdown_rows.append({'Category': 'NET PAYOUT', 'Amount': f"${sel.total_amount:,.2f}"})
+            st.dataframe(
+                pd.DataFrame(breakdown_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            # Reconciliation verdict
+            if sel.reconciles:
+                st.success(f"RECONCILED: Sum of {len(sel.rows)} rows = ${sel.sum_of_rows:,.2f} matches payout of ${sel.total_amount:,.2f}")
+            else:
+                st.error(f"MISMATCH: Sum ${sel.sum_of_rows:,.2f} vs Payout ${sel.total_amount:,.2f} (diff: ${diff:,.2f})")
+
+        # --- Transaction Type Distribution ---
+        with st.expander("Transaction type distribution", expanded=False):
+            type_counts = {}
+            type_amounts = {}
+            for r in sel.rows:
+                t = r.transaction_type or 'Unknown'
+                type_counts[t] = type_counts.get(t, 0) + 1
+                type_amounts[t] = type_amounts.get(t, 0.0) + r.amount
+
+            type_rows = []
+            for t in sorted(type_counts.keys()):
+                type_rows.append({
+                    'Transaction Type': t,
+                    'Count': type_counts[t],
+                    'Total Amount': f"${type_amounts[t]:,.2f}",
+                })
+            st.dataframe(pd.DataFrame(type_rows), use_container_width=True, hide_index=True)
+
+        # --- Sample Order Cross-Reference ---
+        with st.expander("Order cross-reference (sample)", expanded=False):
+            st.markdown("Verifying that settlement order IDs exist in the Orders API...")
+            order_ids = sel.unique_order_ids[:10]
+
+            if order_ids:
+                from sp_api.api import Orders as OrdersAPI
+                orders_api = OrdersAPI(
+                    credentials=Config.get_sp_api_credentials(),
+                    marketplace=Marketplaces.US,
+                )
+
+                xref_rows = []
+                for oid in order_ids:
+                    # Settlement amounts for this order
+                    settle_amounts = [r.amount for r in sel.rows if r.order_id == oid]
+                    settle_net = round(sum(settle_amounts), 2)
+
+                    try:
+                        resp = orders_api.get_order(oid)
+                        order = resp.payload
+                        api_total = order.get('OrderTotal', {}).get('Amount', 'N/A')
+                        api_status = order.get('OrderStatus', 'N/A')
+                        purchase_date = order.get('PurchaseDate', 'N/A')[:10]
+                        xref_rows.append({
+                            'Order ID': oid,
+                            'Found': 'Yes',
+                            'Status': api_status,
+                            'Customer Paid': f"${api_total}",
+                            'Settlement Net': f"${settle_net:,.2f}",
+                            'Purchase Date': purchase_date,
+                        })
+                    except Exception:
+                        xref_rows.append({
+                            'Order ID': oid,
+                            'Found': 'No',
+                            'Status': '-',
+                            'Customer Paid': '-',
+                            'Settlement Net': f"${settle_net:,.2f}",
+                            'Purchase Date': '-',
+                        })
+                    import time
+                    time.sleep(0.5)
+
+                xref_df = pd.DataFrame(xref_rows)
+                matched = sum(1 for r in xref_rows if r['Found'] == 'Yes')
+                st.dataframe(xref_df, use_container_width=True, hide_index=True)
+                st.markdown(f"**Result: {matched}/{len(xref_rows)} orders verified** — same order ID in both settlement and Orders API.")
+            else:
+                st.write("No order IDs found in this settlement.")
+    else:
+        st.warning("No closed settlement reports found. Reports are generated by Amazon every ~14 days.")
 
 # ---------- Footer ----------
 st.markdown("""
