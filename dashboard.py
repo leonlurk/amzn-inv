@@ -1013,52 +1013,55 @@ else:
 
         # --- Sample Order Cross-Reference ---
         with st.expander("Order cross-reference (sample)", expanded=False):
-            st.markdown("Verifying that settlement order IDs exist in the Orders API...")
+            st.markdown("Verify that settlement order IDs exist in the Orders API.")
             order_ids = sel.unique_order_ids[:10]
 
             if order_ids:
-                from sp_api.api import Orders as OrdersAPI
-                orders_api = OrdersAPI(
-                    credentials=Config.get_sp_api_credentials(),
-                    marketplace=Marketplaces.US,
-                )
-
-                xref_rows = []
-                for oid in order_ids:
-                    # Settlement amounts for this order
-                    settle_amounts = [r.amount for r in sel.rows if r.order_id == oid]
-                    settle_net = round(sum(settle_amounts), 2)
-
-                    try:
-                        resp = orders_api.get_order(oid)
-                        order = resp.payload
-                        api_total = order.get('OrderTotal', {}).get('Amount', 'N/A')
-                        api_status = order.get('OrderStatus', 'N/A')
-                        purchase_date = order.get('PurchaseDate', 'N/A')[:10]
-                        xref_rows.append({
-                            'Order ID': oid,
-                            'Found': 'Yes',
-                            'Status': api_status,
-                            'Customer Paid': f"${api_total}",
-                            'Settlement Net': f"${settle_net:,.2f}",
-                            'Purchase Date': purchase_date,
-                        })
-                    except Exception:
-                        xref_rows.append({
-                            'Order ID': oid,
-                            'Found': 'No',
-                            'Status': '-',
-                            'Customer Paid': '-',
-                            'Settlement Net': f"${settle_net:,.2f}",
-                            'Purchase Date': '-',
-                        })
+                if st.button("Run Cross-Reference", key="xref_btn"):
+                    from sp_api.api import Orders as OrdersAPI
                     import time
-                    time.sleep(0.5)
+                    orders_api = OrdersAPI(
+                        credentials=Config.get_sp_api_credentials(),
+                        marketplace=Marketplaces.US,
+                    )
 
-                xref_df = pd.DataFrame(xref_rows)
-                matched = sum(1 for r in xref_rows if r['Found'] == 'Yes')
-                st.dataframe(xref_df, use_container_width=True, hide_index=True)
-                st.markdown(f"**Result: {matched}/{len(xref_rows)} orders verified** — same order ID in both settlement and Orders API.")
+                    xref_rows = []
+                    progress = st.progress(0, text="Checking orders...")
+                    for idx, oid in enumerate(order_ids):
+                        settle_amounts = [r.amount for r in sel.rows if r.order_id == oid]
+                        settle_net = round(sum(settle_amounts), 2)
+
+                        try:
+                            resp = orders_api.get_order(oid)
+                            order = resp.payload
+                            api_total = order.get('OrderTotal', {}).get('Amount', 'N/A')
+                            api_status = order.get('OrderStatus', 'N/A')
+                            purchase_date = order.get('PurchaseDate', 'N/A')[:10]
+                            xref_rows.append({
+                                'Order ID': oid,
+                                'Found': 'Yes',
+                                'Status': api_status,
+                                'Customer Paid': f"${api_total}",
+                                'Settlement Net': f"${settle_net:,.2f}",
+                                'Purchase Date': purchase_date,
+                            })
+                        except Exception:
+                            xref_rows.append({
+                                'Order ID': oid,
+                                'Found': 'No',
+                                'Status': '-',
+                                'Customer Paid': '-',
+                                'Settlement Net': f"${settle_net:,.2f}",
+                                'Purchase Date': '-',
+                            })
+                        progress.progress((idx + 1) / len(order_ids), text=f"Checking order {idx + 1}/{len(order_ids)}...")
+                        time.sleep(0.5)
+
+                    progress.empty()
+                    xref_df = pd.DataFrame(xref_rows)
+                    matched = sum(1 for r in xref_rows if r['Found'] == 'Yes')
+                    st.dataframe(xref_df, use_container_width=True, hide_index=True)
+                    st.markdown(f"**Result: {matched}/{len(xref_rows)} orders verified** — same order ID in both settlement and Orders API.")
             else:
                 st.write("No order IDs found in this settlement.")
     else:
