@@ -286,7 +286,7 @@ def load_orders(start_str: str, end_str: str, use_mock: bool):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_settlements(use_mock: bool):
+def load_settlements(use_mock: bool, _v: int = 2):
     """Fetch recent settlement reports. Cached for 10 minutes."""
     if use_mock:
         return []
