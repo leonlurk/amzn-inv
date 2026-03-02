@@ -224,39 +224,39 @@ CHART_LAYOUT = dict(
 # Data fetching (cached)
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=900, show_spinner=False)
-def load_sales_ads(start_str: str, end_str: str, use_mock: bool):
-    """Fetch sales and ads data. Cached for 15 minutes."""
+def load_sales(start_str: str, end_str: str, use_mock: bool):
+    """Fetch sales data only. Cached for 15 minutes."""
     start_date = datetime.strptime(start_str, '%Y-%m-%d')
     end_date = datetime.strptime(end_str, '%Y-%m-%d')
     days = (end_date - start_date).days + 1
 
     if use_mock:
-        return get_mock_sales_data(start_date, days), get_mock_ads_data(start_date, days)
-
-    sales_data = []
-    ads_data = []
-
+        return get_mock_sales_data(start_date, days)
     if Config.validate_sp_api():
-        sp_client = SPAPIClient()
-        sales_data = sp_client.fetch_sales_data(start_date, end_date)
-    else:
-        sales_data = get_mock_sales_data(start_date, days)
+        return SPAPIClient().fetch_sales_data(start_date, end_date)
+    return get_mock_sales_data(start_date, days)
 
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_ads(start_str: str, end_str: str, use_mock: bool):
+    """Fetch ads data only. Cached for 15 minutes. Timeout after 120s."""
+    start_date = datetime.strptime(start_str, '%Y-%m-%d')
+    end_date = datetime.strptime(end_str, '%Y-%m-%d')
+    days = (end_date - start_date).days + 1
+
+    if use_mock:
+        return get_mock_ads_data(start_date, days)
     if Config.validate_ads_api():
-        try:
-            ads_client = AmazonAdsClient()
-            ads_data = ads_client.fetch_ads_data(start_date, end_date)
-        except Exception as e:
-            print(f"Ads API error: {e}")
-            # Return zero ads so sales still display
-            ads_data = [AdsData(date=s.date, spend=0, attributed_orders=0,
-                                attributed_revenue=0, attributed_units=0,
-                                clicks=0, impressions=0, acos=0, roas=0)
-                        for s in sales_data]
-    else:
-        ads_data = get_mock_ads_data(start_date, days)
+        return AmazonAdsClient().fetch_ads_data(start_date, end_date, max_wait_seconds=120)
+    return get_mock_ads_data(start_date, days)
 
-    return sales_data, ads_data
+
+def _empty_ads(sales_data):
+    """Return zero-filled ads data matching sales dates."""
+    return [AdsData(date=s.date, spend=0, attributed_orders=0,
+                    attributed_revenue=0, attributed_units=0,
+                    clicks=0, impressions=0, acos=0, roas=0)
+            for s in sales_data]
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -429,17 +429,31 @@ metrics = []
 inventory = None
 daily_orders = None
 
-with st.status("Loading data from Amazon APIs...", expanded=True) as load_status:
-    # 1. Sales + Ads
-    st.write("Requesting sales & ads reports... (this can take 30-60s on first load)")
-    try:
-        sales_data, ads_data = load_sales_ads(start_str, end_str, use_mock)
-        metrics = build_metrics(sales_data, ads_data)
-        st.write(f"Sales: {len(sales_data)} days | Ads: {len(ads_data)} days")
-    except Exception as e:
-        st.write(f"Sales/Ads error: {e}")
+ads_warning = False
 
-    # 2. Inventory
+with st.status("Loading data from Amazon APIs...", expanded=True) as load_status:
+    # 1. Sales (SP-API — usually 30-60s)
+    st.write("Fetching sales report...")
+    try:
+        sales_data = load_sales(start_str, end_str, use_mock)
+        st.write(f"Sales: {len(sales_data)} days")
+    except Exception as e:
+        st.write(f"Sales error: {e}")
+
+    # 2. Ads (Ads API — can take 2+ min, timeout at 120s)
+    st.write("Fetching ads report... (timeout: 2 min)")
+    try:
+        ads_data = load_ads(start_str, end_str, use_mock)
+        st.write(f"Ads: {len(ads_data)} days")
+    except Exception as e:
+        st.write(f"Ads timed out or failed: {e} — showing dashboard without ads data")
+        ads_data = _empty_ads(sales_data) if sales_data else []
+        ads_warning = True
+
+    if sales_data:
+        metrics = build_metrics(sales_data, ads_data)
+
+    # 3. Inventory
     if include_inventory:
         st.write("Fetching inventory snapshot...")
         try:
@@ -448,7 +462,7 @@ with st.status("Loading data from Amazon APIs...", expanded=True) as load_status
         except Exception as e:
             st.write(f"Inventory error: {e}")
 
-    # 3. Orders
+    # 4. Orders
     if include_orders:
         st.write("Fetching daily orders...")
         try:
@@ -461,6 +475,9 @@ with st.status("Loading data from Amazon APIs...", expanded=True) as load_status
         load_status.update(label="All data loaded!", state="complete", expanded=False)
     else:
         load_status.update(label="Failed to load data", state="error", expanded=True)
+
+if ads_warning:
+    st.warning("Ads data unavailable (report timed out after 2 min). Sales, inventory, orders, and settlements are all loaded. Ads metrics will show as $0.")
 
 
 # ---------- Handle export actions ----------
