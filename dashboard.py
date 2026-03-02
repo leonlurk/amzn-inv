@@ -1380,7 +1380,6 @@ else:
                     **CHART_LAYOUT,
                     title=dict(text='Fee % of Gross Revenue Over Time', font=dict(size=14)),
                     yaxis_title='%', height=350,
-                    legend=dict(font=dict(color=COLORS['text'])),
                 )
                 st.plotly_chart(fig_trend, use_container_width=True)
 
