@@ -128,7 +128,6 @@ class AmazonAdsClient:
                 'columns': [
                     'campaignName', 'impressions', 'clicks',
                     'spend', 'sales7d', 'purchases7d',
-                    'unitsSoldClicks7d',
                     'date',
                 ],
                 'reportTypeId': 'spCampaigns',

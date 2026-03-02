@@ -223,9 +223,9 @@ CHART_LAYOUT = dict(
 # ---------------------------------------------------------------------------
 # Data fetching (cached)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def load_sales_ads(start_str: str, end_str: str, use_mock: bool):
-    """Fetch sales and ads data. Cached for 5 minutes."""
+    """Fetch sales and ads data. Cached for 15 minutes."""
     start_date = datetime.strptime(start_str, '%Y-%m-%d')
     end_date = datetime.strptime(end_str, '%Y-%m-%d')
     days = (end_date - start_date).days + 1
