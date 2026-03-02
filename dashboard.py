@@ -429,35 +429,38 @@ metrics = []
 inventory = None
 daily_orders = None
 
-progress_bar = st.progress(0, text="Connecting to Amazon APIs...")
-
-# 1. Sales + Ads
-try:
-    sales_data, ads_data = load_sales_ads(start_str, end_str, use_mock)
-    metrics = build_metrics(sales_data, ads_data)
-except Exception as e:
-    st.toast(f"Sales/Ads error: {e}", icon="⚠️")
-progress_bar.progress(33, text="Sales & Ads loaded. Fetching inventory...")
-
-# 2. Inventory
-if include_inventory:
+with st.status("Loading data from Amazon APIs...", expanded=True) as load_status:
+    # 1. Sales + Ads
+    st.write("Requesting sales & ads reports... (this can take 30-60s on first load)")
     try:
-        inventory = load_inventory(use_mock)
+        sales_data, ads_data = load_sales_ads(start_str, end_str, use_mock)
+        metrics = build_metrics(sales_data, ads_data)
+        st.write(f"Sales: {len(sales_data)} days | Ads: {len(ads_data)} days")
     except Exception as e:
-        st.toast(f"Inventory error: {e}", icon="⚠️")
-progress_bar.progress(66, text="Inventory loaded. Fetching orders...")
+        st.write(f"Sales/Ads error: {e}")
 
-# 3. Orders
-if include_orders:
-    try:
-        daily_orders = load_orders(start_str, end_str, use_mock)
-    except Exception as e:
-        st.toast(f"Orders error: {e}", icon="⚠️")
-progress_bar.progress(100, text="All data loaded!")
+    # 2. Inventory
+    if include_inventory:
+        st.write("Fetching inventory snapshot...")
+        try:
+            inventory = load_inventory(use_mock)
+            st.write(f"Inventory: {len(inventory)} products")
+        except Exception as e:
+            st.write(f"Inventory error: {e}")
 
-import time as _time
-_time.sleep(0.5)
-progress_bar.empty()
+    # 3. Orders
+    if include_orders:
+        st.write("Fetching daily orders...")
+        try:
+            daily_orders = load_orders(start_str, end_str, use_mock)
+            st.write(f"Orders: {len(daily_orders)} days")
+        except Exception as e:
+            st.write(f"Orders error: {e}")
+
+    if metrics:
+        load_status.update(label="All data loaded!", state="complete", expanded=False)
+    else:
+        load_status.update(label="Failed to load data", state="error", expanded=True)
 
 
 # ---------- Handle export actions ----------
