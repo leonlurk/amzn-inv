@@ -933,26 +933,46 @@ else:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # --- Reconciliation KPIs ---
-        rec_cols = st.columns(4)
-        with rec_cols[0]:
-            kpi_card("Payout Amount", f"${sel.total_amount:,.2f}", f"Settlement {sel.settlement_id[:8]}")
-        with rec_cols[1]:
-            kpi_card("Sum of Rows", f"${sel.sum_of_rows:,.2f}", f"{len(sel.rows)} transactions")
-        with rec_cols[2]:
+        # ── 6-Tab Analysis Interface ──
+        tab_overview, tab_explorer, tab_orders, tab_skus, tab_fees, tab_xref = st.tabs([
+            "Overview", "Transaction Explorer", "Per-Order P&L",
+            "SKU Profitability", "Fee Analysis", "Order Cross-Ref",
+        ])
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # TAB 1: OVERVIEW
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        with tab_overview:
+            # Reserve detection alert
+            reserves = sel.detect_reserves()
+            if reserves['has_reserves']:
+                net_r = reserves['net_change']
+                if abs(net_r) > 0.01:
+                    st.warning(
+                        f"**Reserve hold detected:** Amazon is holding ${abs(reserves['current_reserve']):,.2f} "
+                        f"in reserves this period. Previous reserve released: ${reserves['previous_reserve']:,.2f}. "
+                        f"Net impact on payout: **${net_r:+,.2f}**. "
+                        f"This is a common reason your deposit is lower than expected."
+                    )
+
+            # KPI cards
+            rec_cols = st.columns(4)
             diff = round(sel.sum_of_rows - sel.total_amount, 2)
-            kpi_card("Difference", f"${diff:,.2f}",
-                     "RECONCILED" if sel.reconciles else "MISMATCH",
-                     "up" if sel.reconciles else "down")
-        with rec_cols[3]:
-            kpi_card("Orders", f"{len(sel.unique_order_ids)}", "Unique order IDs")
+            with rec_cols[0]:
+                kpi_card("Payout Amount", f"${sel.total_amount:,.2f}", f"Settlement {sel.settlement_id[:8]}")
+            with rec_cols[1]:
+                kpi_card("Sum of Rows", f"${sel.sum_of_rows:,.2f}", f"{len(sel.rows)} transactions")
+            with rec_cols[2]:
+                kpi_card("Difference", f"${diff:,.2f}",
+                         "RECONCILED" if sel.reconciles else "MISMATCH",
+                         "up" if sel.reconciles else "down")
+            with rec_cols[3]:
+                kpi_card("Orders", f"{len(sel.unique_order_ids)}", "Unique order IDs")
 
-        st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
 
-        # --- Breakdown Chart (Sankey-style waterfall) ---
-        breakdown_col, table_col = st.columns([3, 2])
-
-        with breakdown_col:
+            # Breakdown chart + table
+            breakdown_col, table_col = st.columns([3, 2])
             categories = [
                 'Product Charges', 'Shipping', 'Inv. Reimbursements', 'Refunded Expenses',
                 'Refunded Sales', 'Promo Rebates', 'FBA Fees',
@@ -970,71 +990,385 @@ else:
                 COLORS['danger'], COLORS['danger'], COLORS['danger'], COLORS['danger'],
             ]
 
-            fig_breakdown = go.Figure()
-            fig_breakdown.add_trace(go.Bar(
-                x=categories,
-                y=values,
-                marker_color=bar_colors,
-                opacity=0.85,
-                text=[f"${v:,.2f}" for v in values],
-                textposition='outside',
-                textfont=dict(size=11, color=COLORS['text']),
-            ))
-            fig_breakdown.update_layout(
-                **CHART_LAYOUT,
-                title=dict(text='Settlement Breakdown', font=dict(size=14)),
-                yaxis_title='Amount ($)',
-                height=420,
-                showlegend=False,
-            )
-            # Add payout reference line
-            fig_breakdown.add_hline(
-                y=sel.total_amount, line_dash="dash",
-                line_color=COLORS['accent'], opacity=0.6,
-                annotation_text=f"Payout: ${sel.total_amount:,.2f}",
-                annotation_font_color=COLORS['accent'],
-            )
-            st.plotly_chart(fig_breakdown, use_container_width=True)
+            with breakdown_col:
+                fig_breakdown = go.Figure()
+                fig_breakdown.add_trace(go.Bar(
+                    x=categories, y=values,
+                    marker_color=bar_colors, opacity=0.85,
+                    text=[f"${v:,.2f}" for v in values],
+                    textposition='outside',
+                    textfont=dict(size=11, color=COLORS['text']),
+                ))
+                fig_breakdown.update_layout(
+                    **CHART_LAYOUT,
+                    title=dict(text='Settlement Breakdown', font=dict(size=14)),
+                    yaxis_title='Amount ($)', height=420, showlegend=False,
+                )
+                fig_breakdown.add_hline(
+                    y=sel.total_amount, line_dash="dash",
+                    line_color=COLORS['accent'], opacity=0.6,
+                    annotation_text=f"Payout: ${sel.total_amount:,.2f}",
+                    annotation_font_color=COLORS['accent'],
+                )
+                st.plotly_chart(fig_breakdown, use_container_width=True)
 
-        with table_col:
-            st.markdown("**Category Breakdown**")
-            breakdown_rows = []
-            for cat, val in zip(categories, values):
-                breakdown_rows.append({'Category': cat, 'Amount': f"${val:,.2f}"})
-            breakdown_rows.append({'Category': 'NET PAYOUT', 'Amount': f"${sel.total_amount:,.2f}"})
+            with table_col:
+                st.markdown("**Category Breakdown**")
+                breakdown_rows = [{'Category': c, 'Amount': f"${v:,.2f}"} for c, v in zip(categories, values)]
+                breakdown_rows.append({'Category': 'NET PAYOUT', 'Amount': f"${sel.total_amount:,.2f}"})
+                st.dataframe(pd.DataFrame(breakdown_rows), use_container_width=True, hide_index=True)
+
+                if sel.reconciles:
+                    st.success(f"RECONCILED: Sum of {len(sel.rows)} rows = ${sel.sum_of_rows:,.2f} matches payout of ${sel.total_amount:,.2f}")
+                else:
+                    st.error(f"MISMATCH: Sum ${sel.sum_of_rows:,.2f} vs Payout ${sel.total_amount:,.2f} (diff: ${diff:,.2f})")
+
+            # Transaction type distribution
+            with st.expander("Transaction type distribution", expanded=False):
+                type_counts = {}
+                type_amounts = {}
+                for r in sel.rows:
+                    t = r.transaction_type or 'Unknown'
+                    type_counts[t] = type_counts.get(t, 0) + 1
+                    type_amounts[t] = type_amounts.get(t, 0.0) + r.amount
+                type_rows = [
+                    {'Transaction Type': t, 'Count': type_counts[t], 'Total Amount': f"${type_amounts[t]:,.2f}"}
+                    for t in sorted(type_counts.keys())
+                ]
+                st.dataframe(pd.DataFrame(type_rows), use_container_width=True, hide_index=True)
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # TAB 2: TRANSACTION EXPLORER
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        with tab_explorer:
+            st.markdown("**Every transaction in this settlement period — search, filter, export.**")
+
+            df_all = sel.rows_as_dataframe()
+
+            # Filters
+            filter_cols = st.columns([2, 2, 2, 3])
+            with filter_cols[0]:
+                types_available = sorted(df_all['Type'].dropna().unique().tolist())
+                type_filter = st.multiselect("Transaction Type", types_available, default=types_available, key="explorer_type")
+            with filter_cols[1]:
+                cats_available = sorted(df_all['Category'].dropna().unique().tolist())
+                cat_filter = st.multiselect("Category", cats_available, default=cats_available, key="explorer_cat")
+            with filter_cols[2]:
+                skus_available = sorted([s for s in df_all['SKU'].dropna().unique().tolist() if s])
+                sku_filter = st.multiselect("SKU", skus_available, key="explorer_sku")
+            with filter_cols[3]:
+                order_search = st.text_input("Search Order ID", key="explorer_order")
+
+            # Apply filters
+            df_filtered = df_all[
+                (df_all['Type'].isin(type_filter)) &
+                (df_all['Category'].isin(cat_filter))
+            ]
+            if sku_filter:
+                df_filtered = df_filtered[df_filtered['SKU'].isin(sku_filter)]
+            if order_search:
+                df_filtered = df_filtered[df_filtered['Order ID'].str.contains(order_search, case=False, na=False)]
+
+            # Summary metrics
+            sum_cols = st.columns(4)
+            with sum_cols[0]:
+                kpi_card("Filtered Rows", f"{len(df_filtered)}", f"of {len(df_all)} total")
+            with sum_cols[1]:
+                filtered_total = round(df_filtered['Amount'].sum(), 2)
+                kpi_card("Filtered Total", f"${filtered_total:,.2f}", "Sum of filtered amounts")
+            with sum_cols[2]:
+                income = round(df_filtered[df_filtered['Amount'] > 0]['Amount'].sum(), 2)
+                kpi_card("Income", f"${income:,.2f}", "Positive amounts", "up")
+            with sum_cols[3]:
+                expenses = round(df_filtered[df_filtered['Amount'] < 0]['Amount'].sum(), 2)
+                kpi_card("Expenses", f"${expenses:,.2f}", "Negative amounts", "down")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Display table with color formatting
             st.dataframe(
-                pd.DataFrame(breakdown_rows),
+                df_filtered.style.applymap(
+                    lambda v: 'color: #00e676' if isinstance(v, (int, float)) and v > 0
+                    else ('color: #ff5252' if isinstance(v, (int, float)) and v < 0 else ''),
+                    subset=['Amount']
+                ),
                 use_container_width=True,
                 hide_index=True,
+                height=500,
             )
 
-            # Reconciliation verdict
-            if sel.reconciles:
-                st.success(f"RECONCILED: Sum of {len(sel.rows)} rows = ${sel.sum_of_rows:,.2f} matches payout of ${sel.total_amount:,.2f}")
+            # CSV download
+            csv_data = df_filtered.to_csv(index=False)
+            st.download_button(
+                "Download Filtered CSV",
+                csv_data,
+                file_name=f"settlement_{sel.settlement_id}_transactions.csv",
+                mime="text/csv",
+                key="explorer_csv",
+            )
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # TAB 3: PER-ORDER P&L
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        with tab_orders:
+            st.markdown("**Profit & Loss per order — see exactly what Amazon charged on each sale.**")
+
+            order_data = sel.per_order_breakdown()
+            if order_data:
+                df_orders = pd.DataFrame(order_data)
+
+                # Summary metrics
+                total_orders = len(df_orders)
+                avg_fee_pct = df_orders['Fee %'].mean()
+                high_fee_orders = len(df_orders[df_orders['Fee %'] > 35])
+
+                ord_cols = st.columns(4)
+                with ord_cols[0]:
+                    kpi_card("Total Orders", f"{total_orders}", "In this settlement")
+                with ord_cols[1]:
+                    kpi_card("Avg Fee %", f"{avg_fee_pct:.1f}%", "Across all orders")
+                with ord_cols[2]:
+                    kpi_card("High-Fee Orders", f"{high_fee_orders}", "Fee > 35%", "down" if high_fee_orders > 0 else "up")
+                with ord_cols[3]:
+                    total_net = round(df_orders['Net'].sum(), 2)
+                    kpi_card("Total Net", f"${total_net:,.2f}", "After all fees")
+
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                # Styled table
+                st.dataframe(
+                    df_orders.style
+                        .applymap(
+                            lambda v: 'background-color: rgba(255,82,82,0.2)' if isinstance(v, (int, float)) and v > 35 else '',
+                            subset=['Fee %']
+                        )
+                        .applymap(
+                            lambda v: 'color: #00e676' if isinstance(v, (int, float)) and v > 0
+                            else ('color: #ff5252' if isinstance(v, (int, float)) and v < 0 else ''),
+                            subset=['Gross Sale', 'Fees', 'Net']
+                        ),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=500,
+                )
+
+                # Expand detail for specific order
+                with st.expander("Drill into specific order"):
+                    order_ids_available = df_orders['Order ID'].tolist()
+                    selected_order = st.selectbox("Select Order", order_ids_available, key="order_detail_select")
+                    if selected_order:
+                        order_rows = [r for r in sel.rows if r.order_id == selected_order]
+                        detail_data = [{
+                            'Type': r.transaction_type,
+                            'Amount Type': r.amount_type,
+                            'Description': r.amount_description,
+                            'Amount': r.amount,
+                            'Category': sel._row_category(r),
+                        } for r in order_rows]
+                        st.dataframe(pd.DataFrame(detail_data), use_container_width=True, hide_index=True)
+
+                # Optional Finances API enrichment
+                with st.expander("Enrich with Finances API (detailed fee breakdown)"):
+                    st.markdown("Pulls per-order fee details from Amazon's Finances API for the top 5 orders.")
+                    if st.button("Fetch Fee Details", key="enrich_btn"):
+                        import time
+                        fc = FinancesClient()
+                        top_orders = [o['Order ID'] for o in order_data[:5]]
+                        enriched = []
+                        progress = st.progress(0, text="Fetching fee details...")
+                        for idx, oid in enumerate(top_orders):
+                            fees = fc.get_order_fees(oid)
+                            enriched.append({
+                                'Order ID': oid,
+                                'Principal': f"${fees.get('principal', 0):,.2f}",
+                                'Commission': f"${fees.get('commission', 0):,.2f}",
+                                'FBA Fee': f"${fees.get('fba_fee', 0):,.2f}",
+                                'Shipping': f"${fees.get('shipping', 0):,.2f}",
+                                'Promo': f"${fees.get('promo', 0):,.2f}",
+                                'Other': f"${fees.get('other_fees', 0):,.2f}",
+                                'Net': f"${fees.get('net', 0):,.2f}",
+                            })
+                            progress.progress((idx + 1) / len(top_orders), text=f"Order {idx + 1}/{len(top_orders)}...")
+                            time.sleep(0.5)
+                        progress.empty()
+                        st.dataframe(pd.DataFrame(enriched), use_container_width=True, hide_index=True)
             else:
-                st.error(f"MISMATCH: Sum ${sel.sum_of_rows:,.2f} vs Payout ${sel.total_amount:,.2f} (diff: ${diff:,.2f})")
+                st.info("No orders found in this settlement.")
 
-        # --- Transaction Type Distribution ---
-        with st.expander("Transaction type distribution", expanded=False):
-            type_counts = {}
-            type_amounts = {}
-            for r in sel.rows:
-                t = r.transaction_type or 'Unknown'
-                type_counts[t] = type_counts.get(t, 0) + 1
-                type_amounts[t] = type_amounts.get(t, 0.0) + r.amount
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # TAB 4: SKU PROFITABILITY
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        with tab_skus:
+            st.markdown("**Product-level profitability — which SKUs are making money?**")
 
-            type_rows = []
-            for t in sorted(type_counts.keys()):
-                type_rows.append({
-                    'Transaction Type': t,
-                    'Count': type_counts[t],
-                    'Total Amount': f"${type_amounts[t]:,.2f}",
-                })
-            st.dataframe(pd.DataFrame(type_rows), use_container_width=True, hide_index=True)
+            sku_data = sel.sku_profitability()
+            if sku_data:
+                df_skus = pd.DataFrame(sku_data)
 
-        # --- Sample Order Cross-Reference ---
-        with st.expander("Order cross-reference (sample)", expanded=False):
-            st.markdown("Verify that settlement order IDs exist in the Orders API.")
+                # KPIs
+                sku_cols = st.columns(4)
+                with sku_cols[0]:
+                    kpi_card("Products", f"{len(df_skus)}", "Unique SKUs")
+                with sku_cols[1]:
+                    best = df_skus.iloc[0]
+                    kpi_card("Top SKU", f"${best['Net']:,.2f}", best['SKU'][:20], "up")
+                with sku_cols[2]:
+                    worst = df_skus.iloc[-1]
+                    kpi_card("Worst SKU", f"${worst['Net']:,.2f}", worst['SKU'][:20],
+                             "down" if worst['Net'] < 0 else "up")
+                with sku_cols[3]:
+                    avg_margin = df_skus['Margin %'].mean()
+                    kpi_card("Avg Margin", f"{avg_margin:.1f}%", "Across all SKUs",
+                             "up" if avg_margin > 0 else "down")
+
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                # Chart: margin by SKU
+                fig_sku = go.Figure()
+                fig_sku.add_trace(go.Bar(
+                    x=df_skus['SKU'],
+                    y=df_skus['Net'],
+                    marker_color=[COLORS['success'] if n >= 0 else COLORS['danger'] for n in df_skus['Net']],
+                    opacity=0.85,
+                    text=[f"${n:,.2f}" for n in df_skus['Net']],
+                    textposition='outside',
+                    textfont=dict(size=11, color=COLORS['text']),
+                ))
+                fig_sku.update_layout(
+                    **CHART_LAYOUT,
+                    title=dict(text='Net Profit by SKU', font=dict(size=14)),
+                    yaxis_title='Net ($)', height=380, showlegend=False,
+                )
+                st.plotly_chart(fig_sku, use_container_width=True)
+
+                # Table
+                st.dataframe(
+                    df_skus.style.applymap(
+                        lambda v: 'color: #00e676' if isinstance(v, (int, float)) and v > 0
+                        else ('color: #ff5252' if isinstance(v, (int, float)) and v < 0 else ''),
+                        subset=['Revenue', 'Fees', 'Net', 'Margin %']
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info("No SKU data found in this settlement.")
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # TAB 5: FEE ANALYSIS
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        with tab_fees:
+            st.markdown("**Where your money goes — fee breakdown as percentage of gross revenue.**")
+
+            ratios = sel.fee_ratios()
+            gross_revenue = sel.product_charges + sel.shipping_revenue
+
+            # KPIs
+            fee_kpi_cols = st.columns(5)
+            with fee_kpi_cols[0]:
+                kpi_card("Gross Revenue", f"${gross_revenue:,.2f}", "Products + Shipping")
+            with fee_kpi_cols[1]:
+                kpi_card("Amazon Fees", f"{ratios['amazon_fees_pct']}%", f"${abs(sel.amazon_fees):,.2f}", "down")
+            with fee_kpi_cols[2]:
+                kpi_card("FBA Fees", f"{ratios['fba_pct']}%", f"${abs(sel.fba_fees):,.2f}", "down")
+            with fee_kpi_cols[3]:
+                kpi_card("Advertising", f"{ratios['ads_pct']}%", f"${abs(sel.advertising_costs):,.2f}", "down")
+            with fee_kpi_cols[4]:
+                kpi_card("Total Fees", f"{ratios['total_fee_pct']}%", "Of gross revenue", "down")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Pie chart + waterfall
+            pie_col, waterfall_col = st.columns(2)
+
+            with pie_col:
+                fee_labels = ['Amazon Fees', 'FBA Fees', 'Advertising', 'Shipping Charges']
+                fee_values = [abs(sel.amazon_fees), abs(sel.fba_fees), abs(sel.advertising_costs), abs(sel.shipping_charges)]
+                if sel.other_fees:
+                    fee_labels.append('Other Fees')
+                    fee_values.append(abs(sel.other_fees))
+
+                fig_pie = go.Figure(data=[go.Pie(
+                    labels=fee_labels,
+                    values=fee_values,
+                    hole=0.45,
+                    marker=dict(colors=[COLORS['danger'], COLORS['warning'], '#a78bfa', COLORS['accent'], '#64748b']),
+                    textinfo='label+percent',
+                    textfont=dict(size=12, color='white'),
+                )])
+                fig_pie.update_layout(
+                    **CHART_LAYOUT,
+                    title=dict(text='Fee Distribution', font=dict(size=14)),
+                    height=380,
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_pie, use_container_width=True)
+
+            with waterfall_col:
+                # Waterfall: Revenue → Fees → Net
+                waterfall_cats = ['Gross Revenue', 'Amazon Fees', 'FBA Fees', 'Advertising',
+                                  'Shipping Charges', 'Refunds', 'Promos', 'Other', 'Net Payout']
+                waterfall_vals = [
+                    gross_revenue, sel.amazon_fees, sel.fba_fees, sel.advertising_costs,
+                    sel.shipping_charges, sel.refunded_sales, sel.promo_rebates,
+                    sel.other_fees + sel.inventory_reimbursements + sel.refunded_expenses,
+                    sel.total_amount,
+                ]
+                waterfall_measure = ['absolute'] + ['relative'] * 7 + ['total']
+
+                fig_wf = go.Figure(data=[go.Waterfall(
+                    x=waterfall_cats,
+                    y=waterfall_vals,
+                    measure=waterfall_measure,
+                    increasing=dict(marker_color=COLORS['success']),
+                    decreasing=dict(marker_color=COLORS['danger']),
+                    totals=dict(marker_color=COLORS['accent']),
+                    textposition='outside',
+                    text=[f"${v:,.2f}" for v in waterfall_vals],
+                    textfont=dict(size=10, color=COLORS['text']),
+                )])
+                fig_wf.update_layout(
+                    **CHART_LAYOUT,
+                    title=dict(text='Revenue to Payout Waterfall', font=dict(size=14)),
+                    height=380, showlegend=False,
+                )
+                st.plotly_chart(fig_wf, use_container_width=True)
+
+            # Settlement comparison (if multiple settlements)
+            if len(settlements) > 1:
+                st.markdown("---")
+                st.markdown("**Fee Trends Across Settlements**")
+                trend_data = []
+                for s in settlements:
+                    r = s.fee_ratios()
+                    trend_data.append({
+                        'Period': f"{s.start_date[:10]} → {s.end_date[:10]}",
+                        'Amazon Fees %': r['amazon_fees_pct'],
+                        'FBA %': r['fba_pct'],
+                        'Ads %': r['ads_pct'],
+                        'Total Fee %': r['total_fee_pct'],
+                    })
+                df_trend = pd.DataFrame(trend_data)
+
+                fig_trend = go.Figure()
+                for col in ['Amazon Fees %', 'FBA %', 'Ads %', 'Total Fee %']:
+                    fig_trend.add_trace(go.Scatter(
+                        x=df_trend['Period'], y=df_trend[col],
+                        mode='lines+markers', name=col,
+                    ))
+                fig_trend.update_layout(
+                    **CHART_LAYOUT,
+                    title=dict(text='Fee % of Gross Revenue Over Time', font=dict(size=14)),
+                    yaxis_title='%', height=350,
+                    legend=dict(font=dict(color=COLORS['text'])),
+                )
+                st.plotly_chart(fig_trend, use_container_width=True)
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # TAB 6: ORDER CROSS-REFERENCE
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        with tab_xref:
+            st.markdown("**Verify that settlement order IDs exist in the Orders API — proves no double-invoicing.**")
             order_ids = sel.unique_order_ids[:10]
 
             if order_ids:
@@ -1059,18 +1393,14 @@ else:
                             api_status = order.get('OrderStatus', 'N/A')
                             purchase_date = order.get('PurchaseDate', 'N/A')[:10]
                             xref_rows.append({
-                                'Order ID': oid,
-                                'Found': 'Yes',
-                                'Status': api_status,
+                                'Order ID': oid, 'Found': 'Yes', 'Status': api_status,
                                 'Customer Paid': f"${api_total}",
                                 'Settlement Net': f"${settle_net:,.2f}",
                                 'Purchase Date': purchase_date,
                             })
                         except Exception:
                             xref_rows.append({
-                                'Order ID': oid,
-                                'Found': 'No',
-                                'Status': '-',
+                                'Order ID': oid, 'Found': 'No', 'Status': '-',
                                 'Customer Paid': '-',
                                 'Settlement Net': f"${settle_net:,.2f}",
                                 'Purchase Date': '-',

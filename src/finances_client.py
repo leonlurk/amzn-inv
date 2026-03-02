@@ -89,6 +89,205 @@ class SettlementSummary:
             if r.order_id and r.transaction_type in ('Order', 'Refund')
         ))
 
+    def _row_category(self, r: 'SettlementRow') -> str:
+        """Map a single row to its Sankey category name."""
+        desc = r.amount_description or ''
+        atype = r.amount_type or ''
+        ttype = r.transaction_type or ''
+
+        if ttype == 'Order':
+            if atype == 'ItemPrice':
+                if 'Tax' in desc:
+                    return 'Tax'
+                elif 'Shipping' in desc:
+                    return 'Shipping'
+                return 'Product Charges'
+            elif atype == 'ItemFees':
+                return 'Amazon Fees'
+            elif atype == 'ItemWithheldTax':
+                return 'Tax'
+            elif atype == 'Promotion':
+                return 'Promo Rebates'
+        elif ttype == 'Refund':
+            if atype == 'ItemPrice':
+                if 'Tax' in desc:
+                    return 'Tax'
+                return 'Refunded Sales'
+            elif atype == 'ItemFees':
+                return 'Refunded Expenses'
+            elif atype == 'ItemWithheldTax':
+                return 'Tax'
+            elif atype == 'Promotion':
+                return 'Promo Rebates'
+            return 'Refunded Sales'
+        elif ttype == 'ServiceFee':
+            if 'dvertising' in atype:
+                return 'Cost of Advertising'
+            return 'Other Fees'
+        elif ttype == 'other-transaction':
+            if 'Reimbursement' in atype:
+                return 'Inv. Reimbursements'
+            elif 'Subscription' in desc:
+                return 'Amazon Fees'
+            elif 'Inbound' in desc or 'Placement' in desc:
+                return 'FBA Fees'
+            elif 'Reserve' in desc or 'Reserve' in atype:
+                return 'Reserve'
+            return 'Shipping Charges'
+
+        if r.amount > 0:
+            return 'Other Income'
+        return 'Other Fees'
+
+    def rows_as_dataframe(self):
+        """Convert rows to a pandas DataFrame with a category column."""
+        import pandas as pd
+        data = []
+        for r in self.rows:
+            data.append({
+                'Posted Date': r.posted_date,
+                'Order ID': r.order_id,
+                'SKU': r.sku,
+                'Qty': r.quantity,
+                'Type': r.transaction_type,
+                'Amount Type': r.amount_type,
+                'Description': r.amount_description,
+                'Amount': r.amount,
+                'Category': self._row_category(r),
+            })
+        return pd.DataFrame(data)
+
+    def per_order_breakdown(self) -> list[dict]:
+        """Group rows by order_id and compute P&L per order."""
+        from collections import defaultdict
+        orders = defaultdict(lambda: {
+            'sku': '', 'qty': 0, 'gross': 0.0, 'fees': 0.0,
+            'promos': 0.0, 'refunds': 0.0, 'net': 0.0, 'posted': '',
+        })
+
+        for r in self.rows:
+            if not r.order_id:
+                continue
+            o = orders[r.order_id]
+            if r.sku and not o['sku']:
+                o['sku'] = r.sku
+            if r.quantity:
+                o['qty'] += r.quantity
+            if r.posted_date and not o['posted']:
+                o['posted'] = r.posted_date
+
+            cat = self._row_category(r)
+            if cat in ('Product Charges', 'Shipping'):
+                o['gross'] += r.amount
+            elif cat in ('Amazon Fees', 'FBA Fees', 'Cost of Advertising', 'Shipping Charges', 'Other Fees'):
+                o['fees'] += r.amount
+            elif cat == 'Promo Rebates':
+                o['promos'] += r.amount
+            elif cat in ('Refunded Sales', 'Refunded Expenses'):
+                o['refunds'] += r.amount
+            o['net'] += r.amount
+
+        result = []
+        for oid, o in orders.items():
+            gross = round(o['gross'], 2)
+            fee_pct = round(abs(o['fees']) / gross * 100, 1) if gross > 0 else 0.0
+            result.append({
+                'Order ID': oid,
+                'SKU': o['sku'],
+                'Qty': o['qty'],
+                'Gross Sale': round(o['gross'], 2),
+                'Fees': round(o['fees'], 2),
+                'Promos': round(o['promos'], 2),
+                'Refunds': round(o['refunds'], 2),
+                'Net': round(o['net'], 2),
+                'Fee %': fee_pct,
+                'Posted': o['posted'],
+            })
+        result.sort(key=lambda x: x['Net'], reverse=True)
+        return result
+
+    def sku_profitability(self) -> list[dict]:
+        """Group rows by SKU and compute profitability per product."""
+        from collections import defaultdict
+        skus = defaultdict(lambda: {
+            'units': 0, 'revenue': 0.0, 'fees': 0.0,
+            'refunds': 0.0, 'promos': 0.0, 'net': 0.0,
+        })
+
+        for r in self.rows:
+            if not r.sku:
+                continue
+            s = skus[r.sku]
+            if r.quantity and r.transaction_type == 'Order':
+                s['units'] += r.quantity
+
+            cat = self._row_category(r)
+            if cat in ('Product Charges', 'Shipping'):
+                s['revenue'] += r.amount
+            elif cat in ('Amazon Fees', 'FBA Fees', 'Cost of Advertising', 'Shipping Charges', 'Other Fees'):
+                s['fees'] += r.amount
+            elif cat == 'Promo Rebates':
+                s['promos'] += r.amount
+            elif cat in ('Refunded Sales', 'Refunded Expenses'):
+                s['refunds'] += r.amount
+            s['net'] += r.amount
+
+        result = []
+        for sku, s in skus.items():
+            rev = round(s['revenue'], 2)
+            net = round(s['net'], 2)
+            margin = round(net / rev * 100, 1) if rev > 0 else 0.0
+            result.append({
+                'SKU': sku,
+                'Units': s['units'],
+                'Revenue': rev,
+                'Fees': round(s['fees'], 2),
+                'Refunds': round(s['refunds'], 2),
+                'Promos': round(s['promos'], 2),
+                'Net': net,
+                'Margin %': margin,
+            })
+        result.sort(key=lambda x: x['Net'], reverse=True)
+        return result
+
+    def fee_ratios(self) -> dict:
+        """Compute each fee category as a percentage of gross revenue."""
+        gross = self.product_charges + self.shipping_revenue
+        if gross <= 0:
+            return {'amazon_fees_pct': 0, 'fba_pct': 0, 'ads_pct': 0, 'shipping_pct': 0, 'total_fee_pct': 0}
+        total_fees = abs(self.amazon_fees) + abs(self.fba_fees) + abs(self.advertising_costs) + abs(self.shipping_charges)
+        return {
+            'amazon_fees_pct': round(abs(self.amazon_fees) / gross * 100, 1),
+            'fba_pct': round(abs(self.fba_fees) / gross * 100, 1),
+            'ads_pct': round(abs(self.advertising_costs) / gross * 100, 1),
+            'shipping_pct': round(abs(self.shipping_charges) / gross * 100, 1),
+            'total_fee_pct': round(total_fees / gross * 100, 1),
+        }
+
+    def detect_reserves(self) -> dict:
+        """Detect reserve holds that explain payout discrepancies."""
+        previous = 0.0
+        current = 0.0
+        reserve_rows = []
+        for r in self.rows:
+            desc = (r.amount_description or '').lower()
+            atype = (r.amount_type or '').lower()
+            if 'reserve' in desc or 'reserve' in atype:
+                reserve_rows.append(r)
+                if 'previous' in desc:
+                    previous += r.amount
+                elif 'current' in desc:
+                    current += r.amount
+                else:
+                    current += r.amount
+        return {
+            'previous_reserve': round(previous, 2),
+            'current_reserve': round(current, 2),
+            'net_change': round(previous + current, 2),
+            'has_reserves': len(reserve_rows) > 0,
+            'reserve_rows': reserve_rows,
+        }
+
     def categorize(self):
         """Categorize rows into summary buckets matching Amazon Seller Central's breakdown.
 
