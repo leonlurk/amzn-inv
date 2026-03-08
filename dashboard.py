@@ -7,6 +7,7 @@ import os
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
+import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from src.sp_api_client import SPAPIClient, SalesData, get_mock_sales_data
 from src.ads_api_client import AmazonAdsClient, AdsData, get_mock_ads_data
 from src.inventory_client import InventoryClient, InventoryItem, get_mock_inventory
 from src.orders_client import OrdersClient, DailyOrders, get_mock_daily_orders
-from src.finances_client import FinancesClient
+from src.finances_client import FinancesClient, ReconciliationResult, GL_ACCOUNTS
 from src.metrics import CombinedMetrics, aggregate_weekly
 from src.output import export_to_csv, export_to_google_sheets
 
@@ -853,7 +854,6 @@ if metrics:
 
         with inv_col2:
             # Inventory table
-            import pandas as pd
             inv_rows = []
             for item in inventory:
                 inbound = item.inbound_working + item.inbound_shipped + item.inbound_receiving
@@ -881,7 +881,6 @@ if metrics:
     st.markdown('<div class="section-header">DAILY DATA TABLE</div>', unsafe_allow_html=True)
 
     with st.expander("View detailed daily metrics", expanded=False):
-        import pandas as pd
         table_data = []
         for m in metrics:
             table_data.append({
@@ -911,8 +910,6 @@ st.markdown('<div class="section-header">SETTLEMENT RECONCILIATION</div>', unsaf
 if use_mock:
     st.info("Settlement reconciliation is only available with live API data.")
 else:
-    import pandas as pd
-
     with st.spinner("Loading settlement reports..."):
         settlements = load_settlements(use_mock)
 
@@ -953,14 +950,343 @@ else:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # ── 6-Tab Analysis Interface ──
-        tab_overview, tab_explorer, tab_orders, tab_skus, tab_fees, tab_xref = st.tabs([
+        # ── 8-Tab Analysis Interface ──
+        tab_recon, tab_je, tab_sku_sales, tab_overview, tab_explorer, tab_orders, tab_skus, tab_fees = st.tabs([
+            "📊 Reconciliation", "📋 JE Summary", "📦 SKU Sales",
             "Overview", "Transaction Explorer", "Per-Order P&L",
-            "SKU Profitability", "Fee Analysis", "Order Cross-Ref",
+            "SKU Profitability", "Fee Analysis",
         ])
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # TAB 1: OVERVIEW
+        # TAB: RECONCILIATION (4a-4h Structure)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        with tab_recon:
+            # ═══════════════════════════════════════════════════════════════
+            # HOW THIS RECONCILIATION WORKS (Cover Sheet per Mike's spec)
+            # ═══════════════════════════════════════════════════════════════
+            with st.expander("📋 How This Reconciliation Works", expanded=False):
+                st.markdown("""
+                ### Reconciliation Methodology (Mike's Specification)
+
+                **Formula: (A - B) = (D - E)**
+
+                | Component | Description |
+                |-----------|-------------|
+                | **A** | Amazon Payment — The actual payout deposited to your bank |
+                | **B** | Adjust Payment — Seller repayments/billing charges deducted |
+                | **D** | Sales Data — Gross revenue (Product Charges + Shipping + Reimbursements) |
+                | **E** | Adjustments — Timing/data differences explaining why D ≠ A-B |
+
+                ---
+
+                ### Adjustment Categories (4a through 4h) — Mike's Exact Definitions
+
+                Each bucket explains **WHY** there's a difference between Sales Data and Amazon Payment:
+
+                | Line | Category | What It Captures |
+                |------|----------|------------------|
+                | **4a** | Taxes | Tax collected vs. withheld (usually nets to ~$0) |
+                | **4b** | Unsettled Orders | Reserves held by Amazon / orders not yet settled |
+                | **4c** | Service Fee Timing | **Account-level fees assessed period N, deducted N+1:** Subscription, FBA Storage, Long-Term Storage, Inbound Transportation, Inbound Placement, AWD, Coupon, Removal/Disposal |
+                | **4d** | Ad Spend Timing | Advertising charges (ServiceFee transactions) |
+                | **4e** | Prior Period Orders | **Per-order fees:** FBA fulfillment fees + Commission on orders settling in this payout |
+                | **4f** | Fees Not in Sales | Items with **NO sales data entry:** Buy Shipping Labels, Amazon Deal fees, Order promotions |
+                | **4g** | Cross-Period Refunds | Refunded sales amounts (ideally only cross-period refunds) |
+                | **4h** | Opening Balance | Other adjustments, reimbursements, uncategorized items |
+
+                ---
+
+                ### Key Distinction: 4c vs 4e
+
+                - **4c (Service Fee Timing)**: Account-level recurring fees like Subscription, Storage, Inbound — NOT per-order
+                - **4e (Prior Period Orders)**: Per-order fees like FBAPerUnitFulfillmentFee, Commission — tied to specific orders
+
+                ---
+
+                ### Quality Control (Per Mike's Spec)
+
+                - **NO PLUGS ALLOWED** — Every item must be individually identified
+                - **Final Difference must be $0.00** — If not, there are unresolved items
+                - **Notes section** appears ONLY when there are exceptions
+                - Every row is identified by order number, date, and amount
+                """)
+
+            st.markdown("""
+            **Full Settlement Reconciliation** — Matching Amazon Payment to Sales Data with timing adjustments.
+
+            Formula: **(A - B) = (D - E)** where E = Σ(4a through 4h)
+            """)
+
+            # Option to fetch order dates (default ON per Mike's spec for accurate 4e/4g)
+            fetch_dates = st.checkbox(
+                "Fetch PurchaseDate for accurate 4e/4g detection",
+                value=True,
+                help="Fetches order dates to identify TRUE prior-period orders and cross-period refunds. Takes ~20-30 seconds."
+            )
+
+            # Run reconciliation with order dates by default (per Mike's spec)
+            with st.spinner("Running reconciliation..." + (" (fetching order dates)" if fetch_dates else "")):
+                fc = FinancesClient()
+                recon = fc.reconcile_settlement(sel, fetch_order_dates=fetch_dates)
+
+            # Main reconciliation table
+            st.markdown("### Settlement Reconciliation")
+
+            recon_cols = st.columns(4)
+            with recon_cols[0]:
+                kpi_card("A - Amazon Payment", f"${recon.amazon_payment:,.2f}", "Payout from settlement")
+            with recon_cols[1]:
+                kpi_card("B - Adjust Payment", f"${recon.adjust_payment:,.2f}", "Seller repayments/billing")
+            with recon_cols[2]:
+                kpi_card("A-B Net Payment", f"${recon.adjusted_amazon_payment:,.2f}", "Adjusted payout")
+            with recon_cols[3]:
+                status = "✅ RECONCILED" if recon.is_reconciled else f"❌ Diff: ${recon.final_difference:,.2f}"
+                kpi_card("Status", status, f"Final difference: ${recon.final_difference:,.2f}",
+                        "up" if recon.is_reconciled else "down")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Adjustments breakdown (E = 4a through 4h)
+            st.markdown("### Adjustments (E) — Deductions from Revenue")
+
+            adj_data = [
+                {"Line": "4a", "Category": "Taxes", "Amount": f"${recon.adj_4a_taxes:,.2f}",
+                 "Description": "Tax collected vs withheld (usually nets to $0)", "Items": len(recon.detail_4a)},
+                {"Line": "4b", "Category": "Unsettled Orders", "Amount": f"${recon.adj_4b_unsettled_orders:,.2f}",
+                 "Description": "Reserves/orders not yet settled by Amazon", "Items": len(recon.detail_4b)},
+                {"Line": "4c", "Category": "Service Fee Timing", "Amount": f"${recon.adj_4c_service_fee_timing:,.2f}",
+                 "Description": "Subscription, Storage, Inbound, Disposal, Coupon fees", "Items": len(recon.detail_4c)},
+                {"Line": "4d", "Category": "Ad Spend Timing", "Amount": f"${recon.adj_4d_ad_spend_timing:,.2f}",
+                 "Description": "Advertising charges", "Items": len(recon.detail_4d)},
+                {"Line": "4e", "Category": "Prior Period Orders", "Amount": f"${recon.adj_4e_prior_period_orders:,.2f}",
+                 "Description": "Per-order fees (FBA fulfillment + Commission)", "Items": len(recon.detail_4e)},
+                {"Line": "4f", "Category": "Fees Not in Sales", "Amount": f"${recon.adj_4f_fees_not_in_sales:,.2f}",
+                 "Description": "Shipping labels, Deal fees, Promotions (no sales entry)", "Items": len(recon.detail_4f)},
+                {"Line": "4g", "Category": "Cross-Period Refunds", "Amount": f"${recon.adj_4g_cross_period_refunds:,.2f}",
+                 "Description": "Refunded sales amounts", "Items": len(recon.detail_4g)},
+                {"Line": "4h", "Category": "Opening Balance", "Amount": f"${recon.adj_4h_opening_balance:,.2f}",
+                 "Description": "Other adjustments, reimbursements", "Items": len(recon.detail_4h)},
+            ]
+            df_adj = pd.DataFrame(adj_data)
+            st.dataframe(df_adj, use_container_width=True, hide_index=True)
+
+            # Summary row
+            sum_cols = st.columns(3)
+            with sum_cols[0]:
+                kpi_card("D - Sales Data", f"${recon.sales_data_total:,.2f}", "Orders in period")
+            with sum_cols[1]:
+                kpi_card("E - Total Adjustments", f"${recon.total_adjustments:,.2f}", "Sum of 4a-4h")
+            with sum_cols[2]:
+                kpi_card("D-E Adjusted Sales", f"${recon.adjusted_sales_data:,.2f}", "Should match A-B")
+
+            # ═══════════════════════════════════════════════════════════════
+            # NOTES SECTION - Per Mike's spec: EXCEPTIONS ONLY
+            # This section only appears when Final Difference ≠ $0
+            # ═══════════════════════════════════════════════════════════════
+            if recon.exceptions or not recon.is_reconciled:
+                st.markdown("---")
+                st.markdown("### Notes (Exceptions Only)")
+                st.caption("This section lists unresolved items requiring investigation. It should be empty when fully reconciled.")
+
+                if not recon.is_reconciled:
+                    st.error(f"**Final Difference: ${recon.final_difference:,.2f}** — Reconciliation incomplete")
+
+                note_num = 1
+                for exc in recon.exceptions:
+                    if exc.get('type') == 'unresolved_difference':
+                        st.warning(f"**Note {note_num}:** Unresolved difference of ${exc['amount']:,.2f}")
+                        st.markdown(f"  - {exc.get('message', 'Requires investigation')}")
+                        if exc.get('note'):
+                            st.markdown(f"  - {exc['note']}")
+                        note_num += 1
+                    else:
+                        st.info(f"**Note {note_num}:** {exc.get('message', '')}")
+                        note_num += 1
+
+            # Detail expanders for each adjustment category
+            with st.expander("View Adjustment Details (4a-4h)", expanded=False):
+                detail_tab = st.selectbox("Select adjustment category:",
+                    ["4a - Taxes", "4b - Unsettled Orders", "4c - Service Fee Timing",
+                     "4d - Ad Spend Timing", "4e - Prior Period Orders",
+                     "4f - Fees Not in Sales", "4g - Cross-Period Refunds", "4h - Opening Balance"])
+
+                if detail_tab == "4a - Taxes" and recon.detail_4a:
+                    st.dataframe(pd.DataFrame(recon.detail_4a), use_container_width=True, hide_index=True)
+                elif detail_tab == "4b - Unsettled Orders" and recon.detail_4b:
+                    st.dataframe(pd.DataFrame(recon.detail_4b), use_container_width=True, hide_index=True)
+                elif detail_tab == "4c - Service Fee Timing" and recon.detail_4c:
+                    st.dataframe(pd.DataFrame(recon.detail_4c), use_container_width=True, hide_index=True)
+                elif detail_tab == "4d - Ad Spend Timing" and recon.detail_4d:
+                    st.dataframe(pd.DataFrame(recon.detail_4d), use_container_width=True, hide_index=True)
+                elif detail_tab == "4e - Prior Period Orders" and recon.detail_4e:
+                    st.dataframe(pd.DataFrame(recon.detail_4e), use_container_width=True, hide_index=True)
+                elif detail_tab == "4f - Fees Not in Sales" and recon.detail_4f:
+                    st.dataframe(pd.DataFrame(recon.detail_4f), use_container_width=True, hide_index=True)
+                elif detail_tab == "4g - Cross-Period Refunds" and recon.detail_4g:
+                    st.dataframe(pd.DataFrame(recon.detail_4g), use_container_width=True, hide_index=True)
+                elif detail_tab == "4h - Opening Balance" and recon.detail_4h:
+                    st.dataframe(pd.DataFrame(recon.detail_4h), use_container_width=True, hide_index=True)
+                else:
+                    st.info("No detail items for this category.")
+
+            # Export to Google Sheets button
+            st.markdown("---")
+            st.markdown("### Export to Google Sheets")
+            st.markdown("""
+            Export full reconciliation with detail tabs to Google Sheets:
+            - **Reconciliation** (summary with Notes section)
+            - **4c Service Fee Timing** (individual transactions)
+            - **4e Prior Period Orders** (with PurchaseDate)
+            - **4f Fees Not in Sales** (shipping labels, deal fees)
+            - **4g Cross-Period Refunds** (with PurchaseDate)
+            - **4h Opening Balance** (other adjustments)
+            - **JE Summary** (by GL account)
+            - **SKU Sales** (units and revenue)
+            """)
+
+            export_cols = st.columns([2, 1])
+            with export_cols[0]:
+                num_periods = st.selectbox(
+                    "Number of periods to export:",
+                    options=[1, 3, 5, 10],
+                    index=1,
+                    help="How many settlement periods to include in the export"
+                )
+            with export_cols[1]:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("Export to Google Sheets", key="export_recon_btn", type="primary"):
+                    if Config.GOOGLE_SHEET_ID:
+                        with st.spinner(f"Exporting {num_periods} periods to Google Sheets..."):
+                            from src.output import export_reconciliation_to_sheets
+                            success = export_reconciliation_to_sheets(
+                                spreadsheet_id=Config.GOOGLE_SHEET_ID,
+                                count=num_periods,
+                                fetch_order_dates=True,
+                            )
+                        if success:
+                            st.success(f"Exported {num_periods} periods with all detail tabs!")
+                        else:
+                            st.error("Export failed - check credentials and sheet ID")
+                    else:
+                        st.error("GOOGLE_SHEET_ID not configured in .env")
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # TAB: JE SUMMARY (Journal Entry Preparation)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        with tab_je:
+            st.markdown("""
+            **Journal Entry Preparation** — Settlement transactions mapped to GL accounts, ready for Odoo/QuickBooks.
+            """)
+
+            # Get JE summary
+            je_data = sel.je_summary()
+            df_je = pd.DataFrame(je_data)
+
+            # Summary metrics
+            total_debits = df_je['debit'].sum()
+            total_credits = df_je['credit'].sum()
+
+            je_cols = st.columns(4)
+            with je_cols[0]:
+                kpi_card("Total Debits", f"${total_debits:,.2f}", "DR entries")
+            with je_cols[1]:
+                kpi_card("Total Credits", f"${total_credits:,.2f}", "CR entries")
+            with je_cols[2]:
+                balance = round(total_debits - total_credits, 2)
+                kpi_card("Balance", f"${balance:,.2f}", "Should be $0.00",
+                        "up" if abs(balance) < 0.01 else "down")
+            with je_cols[3]:
+                kpi_card("GL Accounts", f"{len(je_data)}", "Unique accounts")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # JE Table
+            st.markdown(f"### Journal Entry for Period {sel.start_date[:10]} to {sel.end_date[:10]}")
+
+            # Format for display
+            df_je_display = df_je.copy()
+            df_je_display['debit'] = df_je_display['debit'].apply(lambda x: f"${x:,.2f}" if x > 0 else "")
+            df_je_display['credit'] = df_je_display['credit'].apply(lambda x: f"${x:,.2f}" if x > 0 else "")
+            df_je_display.columns = ['Account', 'Account Name', 'Debit', 'Credit', 'Description']
+
+            st.dataframe(df_je_display, use_container_width=True, hide_index=True)
+
+            # GL Account reference
+            with st.expander("GL Account Reference", expanded=False):
+                gl_ref = [{"Account": k, "Name": v['name'], "Type": v['type']}
+                          for k, v in GL_ACCOUNTS.items()]
+                st.dataframe(pd.DataFrame(gl_ref), use_container_width=True, hide_index=True)
+
+            # Download JE as CSV
+            je_csv = df_je.to_csv(index=False)
+            st.download_button(
+                "Download JE Summary CSV",
+                je_csv,
+                file_name=f"je_summary_{sel.settlement_id}.csv",
+                mime="text/csv",
+                key="je_csv_download",
+            )
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # TAB: SKU SALES (Units & Revenue by SKU)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        with tab_sku_sales:
+            st.markdown("""
+            **SKU-Level Sales Data** — Units sold and revenue by product for this settlement period.
+            Use this for COGS calculation and inventory reconciliation.
+            """)
+
+            sku_sales = sel.sku_sales_summary()
+            if sku_sales:
+                df_sku_sales = pd.DataFrame(sku_sales)
+
+                # Summary metrics
+                total_units = df_sku_sales['units_sold'].sum()
+                total_revenue = df_sku_sales['gross_revenue'].sum()
+                total_refund_units = df_sku_sales['refund_units'].sum()
+                net_units = df_sku_sales['net_units'].sum()
+
+                sku_cols = st.columns(4)
+                with sku_cols[0]:
+                    kpi_card("Total Units Sold", f"{total_units}", "Gross units")
+                with sku_cols[1]:
+                    kpi_card("Gross Revenue", f"${total_revenue:,.2f}", "Before refunds")
+                with sku_cols[2]:
+                    kpi_card("Refund Units", f"{total_refund_units}", "Units returned", "down")
+                with sku_cols[3]:
+                    kpi_card("Net Units", f"{net_units}", "After refunds")
+
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                # SKU Sales table
+                st.markdown("### Sales by SKU")
+                df_sku_display = df_sku_sales.copy()
+                df_sku_display.columns = ['SKU', 'Units Sold', 'Gross Revenue', 'Refund Units',
+                                          'Refund Amount', 'Net Units', 'Net Revenue']
+                st.dataframe(
+                    df_sku_display.style.applymap(
+                        lambda v: 'color: #00e676' if isinstance(v, (int, float)) and v > 0
+                        else ('color: #ff5252' if isinstance(v, (int, float)) and v < 0 else ''),
+                        subset=['Gross Revenue', 'Net Revenue']
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                # Download SKU sales
+                sku_csv = df_sku_sales.to_csv(index=False)
+                st.download_button(
+                    "Download SKU Sales CSV",
+                    sku_csv,
+                    file_name=f"sku_sales_{sel.settlement_id}.csv",
+                    mime="text/csv",
+                    key="sku_sales_csv",
+                )
+            else:
+                st.info("No SKU sales data found in this settlement.")
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # TAB: OVERVIEW (Original)
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         with tab_overview:
             # Reserve detection alert
@@ -1383,57 +1709,6 @@ else:
                 )
                 st.plotly_chart(fig_trend, use_container_width=True)
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # TAB 6: ORDER CROSS-REFERENCE
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        with tab_xref:
-            st.markdown("**Verify that settlement order IDs exist in the Orders API — proves no double-invoicing.**")
-            order_ids = sel.unique_order_ids[:10]
-
-            if order_ids:
-                if st.button("Run Cross-Reference", key="xref_btn"):
-                    from sp_api.api import Orders as OrdersAPI
-                    import time
-                    orders_api = OrdersAPI(
-                        credentials=Config.get_sp_api_credentials(),
-                        marketplace=Marketplaces.US,
-                    )
-
-                    xref_rows = []
-                    progress = st.progress(0, text="Checking orders...")
-                    for idx, oid in enumerate(order_ids):
-                        settle_amounts = [r.amount for r in sel.rows if r.order_id == oid]
-                        settle_net = round(sum(settle_amounts), 2)
-
-                        try:
-                            resp = orders_api.get_order(oid)
-                            order = resp.payload
-                            api_total = order.get('OrderTotal', {}).get('Amount', 'N/A')
-                            api_status = order.get('OrderStatus', 'N/A')
-                            purchase_date = order.get('PurchaseDate', 'N/A')[:10]
-                            xref_rows.append({
-                                'Order ID': oid, 'Found': 'Yes', 'Status': api_status,
-                                'Customer Paid': f"${api_total}",
-                                'Settlement Net': f"${settle_net:,.2f}",
-                                'Purchase Date': purchase_date,
-                            })
-                        except Exception:
-                            xref_rows.append({
-                                'Order ID': oid, 'Found': 'No', 'Status': '-',
-                                'Customer Paid': '-',
-                                'Settlement Net': f"${settle_net:,.2f}",
-                                'Purchase Date': '-',
-                            })
-                        progress.progress((idx + 1) / len(order_ids), text=f"Checking order {idx + 1}/{len(order_ids)}...")
-                        time.sleep(0.5)
-
-                    progress.empty()
-                    xref_df = pd.DataFrame(xref_rows)
-                    matched = sum(1 for r in xref_rows if r['Found'] == 'Yes')
-                    st.dataframe(xref_df, use_container_width=True, hide_index=True)
-                    st.markdown(f"**Result: {matched}/{len(xref_rows)} orders verified** — same order ID in both settlement and Orders API.")
-            else:
-                st.write("No order IDs found in this settlement.")
     else:
         st.warning("No closed settlement reports found. Reports are generated by Amazon every ~14 days.")
 
